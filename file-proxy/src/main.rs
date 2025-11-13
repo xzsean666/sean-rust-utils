@@ -17,6 +17,9 @@ use aws_sdk_s3::Client as S3Client;
 
 mod s3;
 use s3::{S3Config, S3UrlResponse};
+mod jwt_helper;
+mod jwt_middleware;
+use axum::middleware;
 
 // Command line arguments
 #[derive(Parser, Debug)]
@@ -44,6 +47,14 @@ struct Args {
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
     s3: Option<S3Config>,
+    jwt: Option<JwtConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct JwtConfig {
+    use_jwt: bool,
+    jwt_secret: String,
+    jwt_expires_in: u64,
 }
 
 #[derive(Clone)]
@@ -129,12 +140,27 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build router
-    let app = Router::new()
+    let base_router = Router::new()
         .route("/download", get(download_file))
         .route("/ls", get(list_files))
         .route("/get_s3_url", get(get_s3_url))
         .route("/health", get(health_check))
         .with_state(state);
+
+    // Conditionally enable JWT middleware
+    let app = if let Some(cfg) = config.as_ref().and_then(|c| c.jwt.clone()) {
+        if cfg.use_jwt {
+            let secret = Arc::new(cfg.jwt_secret.clone());
+            base_router.layer(middleware::from_fn_with_state(
+                secret,
+                jwt_middleware::jwt_middleware,
+            ))
+        } else {
+            base_router
+        }
+    } else {
+        base_router
+    };
 
     let bind_addr = format!("0.0.0.0:{}", args.port);
     
