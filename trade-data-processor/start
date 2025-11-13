@@ -1,0 +1,34 @@
+cargo run -- \
+  --config ./config/mark-price-test.config.yaml \
+  --date 2025-11-06 \
+  --data-type mark-price
+
+./release/linux-x64/trade-data-processor \
+  --config ./config/mark-price-test.config.yaml \
+  --date 2025-11-06 \
+  --data-type mark-price
+
+
+cargo run -- \
+  --config ./config/mark-price-http.config.yaml \
+  --date 2025-11-06 \
+  --data-type mark-price
+
+./release/linux-x64/trade-data-processor \
+  --config ./config/mark-price-http.config.yaml \
+  --date 2025-11-05 \
+  --data-type mark-price
+  
+nohup ./release/linux-x64/trade-data-processor \
+  --config ./config/mark-price-http.config.yaml \
+  --date 2025-11-08 \
+  --data-type mark-price > ./logs/mark-price.log 2>&1 &
+
+cargo run -- --config config/mark-price-http.config-test.yaml \
+--date 2025-11-10 \
+--data-type mark-price
+
+./mark-price-merge.sh --date 2025-11-08 --config ./config/mark-price-http.config.yaml
+
+nohup ./mark-price-merge.sh --date 2025-11-09 --config ./config/mark-price-http.config.yaml > logs/mark-price-merge_2025-11-09.log 2>&1 &
+

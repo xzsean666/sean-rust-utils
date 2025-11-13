@@ -1,0 +1,23 @@
+# Rust
+target/
+/config/
+/db/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Test artifacts
+/tmp/
+*.zstd
+*.parquet
+

@@ -1,0 +1,31 @@
+[package]
+name = "wss-collector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.42", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+arrow = "53.2"
+parquet = "53.2"
+chrono = "0.4"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+url = "2.5"
+base64 = "0.22"
+async-trait = "0.1"
+
+
+[profile.release]
+opt-level = "s"         # 优化体积（s < z，z更小但更慢）
+lto = true              # 启用全局链接时优化（Link Time Optimization）
+codegen-units = 1       # 单线程编译，最优优化结果（体积更小，编译更慢）
+panic = "abort"         # 让panic直接中止程序，减少栈展开代码

@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  wss-collector:
+    
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mark-price-wss-collector
+    restart: unless-stopped
+    command: /app/wss-collector --config /app/config.yaml
+    volumes:
+      # 挂载特定的 config 文件（可以改为其他 config 文件，比如 config.prod.yaml）
+      - ./config/mark-price-config.yaml:/app/config.yaml:ro
+      # 挂载数据目录
+      - ./data:/app/data
+    environment:
+      # Optional: set log level
+      - RUST_LOG=info
+    # Uncomment to run in the background
+    # stdin_open: true
+    # tty: true

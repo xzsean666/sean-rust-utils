@@ -1,0 +1,85 @@
+# Trade Data Processor Configuration Example
+#
+# This file shows how to configure SSH connections and output settings
+# for the trade data processor.
+
+# Data sources - define different data types and their SSH sources
+data_sources:
+  # Example: mark-price data type
+  - data_type: "mark-price"
+
+    # List of SSH servers to fetch data from
+    # The first server's data is used as the base, others fill in gaps
+    ssh_servers:
+      # Server 1 - using password authentication
+      # - host: "192.168.1.100"
+      #   port: 22 # Optional, defaults to 22
+      #   username: "datauser"
+      #   password: "your_password_here"
+      #   # Base path on this remote machine (without the date subdirectories)
+      #   # The program will append /{year}/{month}/{day} automatically
+      #   input_base_path: "/hdd16/trade/wss-collector/data/mark-price"
+
+      # Server 2 - using SSH key authentication
+      # 10030 root@47.109.17.166
+      - host: "47.109.17.166"
+        port: 10030
+        username: "sean"
+        private_key_path: "/home/sean/ssh/sean"
+        password: "key_passphrase" # Optional, if key is encrypted
+        input_base_path: "/hdd16/trade/wss-collector/data/mark-price"
+
+      # Server 3 - using SSH key without passphrase
+      # - host: "192.168.1.102"
+      #   username: "datauser"
+      #   private_key_path: "/home/user/.ssh/id_rsa"
+      #   input_base_path: "/mnt/storage/mark-price"
+
+    # List of HTTP servers to fetch data from (optional)
+    # http_servers:
+    #   # Server 1 - direct HTTP connection
+    #   - base_url: "http://198.50.126.194:10048"
+    #     input_base_path: "mark-price"
+    #
+    #   # Server 2 - HTTP connection with proxy
+    #   - base_url: "http://data-server.example.com:8080"
+    #     input_base_path: "mark-price"
+    #     proxy: "http://proxy.example.com:3128"  # Optional proxy URL
+    #
+    #   # Server 3 - HTTPS with SOCKS5 proxy
+    #   - base_url: "https://secure-server.example.com"
+    #     input_base_path: "mark-price"
+    #     proxy: "socks5://proxy.example.com:1080"  # SOCKS5 proxy support
+
+  # You can add more data types here
+  # - data_type: "funding-rate"
+  #   ssh_servers:
+  #     - host: "192.168.1.100"
+  #       username: "datauser"
+  #       password: "password"
+  #       input_base_path: "/hdd16/trade/wss-collector/data/funding-rate"
+  #   http_servers:
+  #     - base_url: "http://data-server.example.com:8080"
+  #       input_base_path: "funding-rate"
+  #       proxy: "http://proxy.example.com:3128"
+
+# Output configuration
+output:
+  # Base path where parquet files will be written
+  # Files will be organized as: {path}/{year}/{month}/{day}/
+  path: "./data/parquet/mark-price"
+
+  # Prefix for parquet file names
+  name: "mark-price"
+
+  # Number of records to buffer before writing to disk
+  # If not set (or set to null), all data for a date will be written to a single file
+  # If set to a number, data will be split into multiple files with this batch size
+  # Larger values = fewer files but more memory usage
+  # batch_size: 10000  # Optional: uncomment and set a value to enable batching
+
+  # Whether to write to /tmp first and then copy to output directory
+  # This can improve performance when the output directory is on slower storage
+  # Set to true to enable: files will be written to /tmp first, then copied to final location
+  # Set to false (or omit) to write directly to output directory
+  # use_temp_dir: false  # Optional: default is false

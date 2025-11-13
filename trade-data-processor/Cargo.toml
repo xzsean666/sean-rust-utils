@@ -1,0 +1,54 @@
+[package]
+name = "trade-data-processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+clap = { version = "4.4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# SSH dependencies
+async-ssh2-tokio = "0.8"
+ssh2 = "0.9"
+
+# HTTP dependencies
+reqwest = { version = "0.11", features = ["json"] }
+indicatif = "0.17"  # For progress bars
+urlencoding = "2.1"  # For URL encoding file paths
+
+# Parquet dependencies
+parquet = "53.0"
+arrow = "53.0"
+
+# Compression
+flate2 = "1.0"  # For gzip compression/decompression
+zstd = "0.13"   # For zstd compression/decompression
+
+# S3 dependencies
+aws-config = { version = "1.1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.13"
+bytes = "1.5"
+
+# Local KV database for sync cache
+sled = "0.34"
+walkdir = "2.4"  # For recursive directory traversal
+sha2 = "0.10"    # For file hashing
+
+# Parallel processing
+rayon = "1.10"  # For CPU-bound parallel processing
+
+
+[profile.release]
+opt-level = "s"         # 优化体积（s < z，z更小但更慢）
+lto = true              # 启用全局链接时优化（Link Time Optimization）
+codegen-units = 1       # 单线程编译，最优优化结果（体积更小，编译更慢）
+panic = "abort"         # 让panic直接中止程序，减少栈展开代码

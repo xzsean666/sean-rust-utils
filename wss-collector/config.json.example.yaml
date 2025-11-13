@@ -1,0 +1,31 @@
+# WSS Collector Configuration (JSON Writer Example)
+
+# WebSocket URL - Example using Binance mark price stream
+wss_url: "wss://fstream.binance.com/stream?streams=!markPrice@arr"
+
+# Base path where JSON files will be stored
+path: "./data"
+
+# Name prefix for the JSON files
+name: "binance"
+
+# Writer type: "json" for line-by-line append mode
+# JSON files are organized as: path/YYYY/MM/DD/name_YYYY-MM-DD.jsonl
+# Each day gets a single .jsonl file with newline-delimited JSON records
+writer_type: "json"
+
+# Optional HTTP proxy URL (uncomment to enable)
+# If set, all WebSocket connections will be routed through this proxy
+proxy: "http://127.0.0.1:7897"
+
+# Optional filter conditions (if not specified, all data is written)
+# Multiple filter conditions use OR logic - data matching ANY condition is included
+# Supported operators: eq, ne, gt, lt, gte, lte, contains
+# Examples:
+filter:
+  - { field: "s", operator: "eq", value: "CFXUSDT" }
+  - { field: "s", operator: "eq", value: "BNBUSDT" }
+  - { field: "s", operator: "eq", value: "BTCUSDT" }
+  - { field: "s", operator: "eq", value: "ETHUSDT" }
+  - { field: "s", operator: "eq", value: "SOLUSDT" }
+

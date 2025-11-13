@@ -1,0 +1,107 @@
+# WSS Collector Configuration
+
+# WebSocket URL - Example using Binance BTC/USDT trade stream
+wss_url: "wss://fstream.binance.com/stream?streams=!markPrice@arr"
+
+# Base path where output files will be stored
+path: "./data"
+
+# Name prefix for the output files
+name: "binance_btcusdt"
+
+# Writer type: "parquet" (default) or "json"
+# - parquet: Batched writes to multiple parquet files (efficient for large datasets)
+# - json: Line-by-line append to a single daily JSON file (simple, human-readable)
+# Default: parquet
+writer_type: "parquet"
+
+# Batch size - number of records to buffer before writing to a new file
+# Only applicable for parquet writer. Each flush creates a separate parquet file with unique timestamp
+# Default: 1000
+batch_size: 1000
+
+# Optional HTTP proxy URL (uncomment to enable)
+# If set, all WebSocket connections will be routed through this proxy
+proxy: "http://127.0.0.1:7897"
+
+# Optional filter conditions (if not specified, all data is written)
+# Multiple filter conditions use OR logic - data matching ANY condition is included
+# Supported operators: eq, ne, gt, lt, gte, lte, contains
+# Examples:
+filter:
+  - { field: "s", operator: "eq", value: "CFXUSDT" }
+  - { field: "s", operator: "eq", value: "BNBUSDT" }
+  - { field: "s", operator: "eq", value: "ENAUSDT" }
+  - { field: "s", operator: "eq", value: "PENDLEUSDT" }
+  - { field: "s", operator: "eq", value: "COWUSDT" }
+  - { field: "s", operator: "eq", value: "SEIUSDT" }
+  - { field: "s", operator: "eq", value: "SOLUSDT" }
+  - { field: "s", operator: "eq", value: "CYBERUSDT" }
+  - { field: "s", operator: "eq", value: "FILUSDT" }
+  - { field: "s", operator: "eq", value: "LTCUSDT" }
+  - { field: "s", operator: "eq", value: "ACTUSDT" }
+  - { field: "s", operator: "eq", value: "RENDERUSDT" }
+  - { field: "s", operator: "eq", value: "TIAUSDT" }
+  - { field: "s", operator: "eq", value: "MOVEUSDT" }
+  - { field: "s", operator: "eq", value: "DOTUSDT" }
+  - { field: "s", operator: "eq", value: "CRVUSDT" }
+  - { field: "s", operator: "eq", value: "BANDUSDT" }
+  - { field: "s", operator: "eq", value: "AUCTIONUSDT" }
+  - { field: "s", operator: "eq", value: "BTCUSDT" }
+  - { field: "s", operator: "eq", value: "EIGENUSDT" }
+  - { field: "s", operator: "eq", value: "LQTYUSDT" }
+  - { field: "s", operator: "eq", value: "NOTUSDT" }
+  - { field: "s", operator: "eq", value: "USUALUSDT" }
+  - { field: "s", operator: "eq", value: "TONUSDT" }
+  - { field: "s", operator: "eq", value: "BATUSDT" }
+  - { field: "s", operator: "eq", value: "SOLVUSDT" }
+  - { field: "s", operator: "eq", value: "AAVEUSDT" }
+  - { field: "s", operator: "eq", value: "POLUSDT" }
+  - { field: "s", operator: "eq", value: "TAOUSDT" }
+  - { field: "s", operator: "eq", value: "JSTUSDT" }
+  - { field: "s", operator: "eq", value: "ORDIUSDT" }
+  - { field: "s", operator: "eq", value: "1INCHUSDT" }
+  - { field: "s", operator: "eq", value: "PHAUSDT" }
+  - { field: "s", operator: "eq", value: "SHELLUSDT" }
+  - { field: "s", operator: "eq", value: "XRPUSDT" }
+  - { field: "s", operator: "eq", value: "PNUTUSDT" }
+  - { field: "s", operator: "eq", value: "BERAUSDT" }
+  - { field: "s", operator: "eq", value: "ARBUSDT" }
+  - { field: "s", operator: "eq", value: "ALTUSDT" }
+  - { field: "s", operator: "eq", value: "APTUSDT" }
+  - { field: "s", operator: "eq", value: "METISUSDT" }
+  - { field: "s", operator: "eq", value: "PENGUUSDT" }
+  - { field: "s", operator: "eq", value: "ANKRUSDT" }
+  - { field: "s", operator: "eq", value: "DOGEUSDT" }
+  - { field: "s", operator: "eq", value: "USDCUSDT" }
+  - { field: "s", operator: "eq", value: "FXSUSDT" }
+  - { field: "s", operator: "eq", value: "XLMUSDT" }
+  - { field: "s", operator: "eq", value: "IMXUSDT" }
+  - { field: "s", operator: "eq", value: "CKBUSDT" }
+  - { field: "s", operator: "eq", value: "ETHUSDT" }
+  - { field: "s", operator: "eq", value: "MUBARAKUSDT" }
+  - { field: "s", operator: "eq", value: "AVAXUSDT" }
+  - { field: "s", operator: "eq", value: "MASKUSDT" }
+  - { field: "s", operator: "eq", value: "MEUSDT" }
+  - { field: "s", operator: "eq", value: "WIFUSDT" }
+  - { field: "s", operator: "eq", value: "TRUMPUSDT" }
+  - { field: "s", operator: "eq", value: "GLMRUSDT" }
+  - { field: "s", operator: "eq", value: "NEARUSDT" }
+  - { field: "s", operator: "eq", value: "MANTAUSDT" }
+  - { field: "s", operator: "eq", value: "KAVAUSDT" }
+  - { field: "s", operator: "eq", value: "KAIAUSDT" }
+  - { field: "s", operator: "eq", value: "WLDUSDT" }
+  - { field: "s", operator: "eq", value: "INJUSDT" }
+  - { field: "s", operator: "eq", value: "OPUSDT" }
+  - { field: "s", operator: "eq", value: "ICPUSDT" }
+  - { field: "s", operator: "eq", value: "NEIROUSDT" }
+  - { field: "s", operator: "eq", value: "BCHUSDT" }
+  - { field: "s", operator: "eq", value: "TRXUSDT" }
+  - { field: "s", operator: "eq", value: "STEEMUSDT" }
+  - { field: "s", operator: "eq", value: "LINKUSDT" }
+  - { field: "s", operator: "eq", value: "ADAUSDT" }
+  - { field: "s", operator: "eq", value: "ASTRUSDT" }
+  - { field: "s", operator: "eq", value: "IDUSDT" }
+  - { field: "s", operator: "eq", value: "PEOPLEUSDT" }
+  - { field: "s", operator: "eq", value: "1000PEPEUSDT" }
+  - { field: "s", operator: "eq", value: "1000SHIBUSDT" }

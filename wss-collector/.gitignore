@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+/config/
+# Data files
+/data/
+*.parquet
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Config files (keep example)
+config.yaml
+!config.example.yaml
+
+# OS files
+.DS_Store
+Thumbs.db

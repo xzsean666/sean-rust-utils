@@ -1,0 +1,1 @@
+./pm2-bot.sh --start './release/linux-x64/wss-collector --config ./config/fundding-rate-config.yaml'
