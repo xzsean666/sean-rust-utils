@@ -5,7 +5,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
@@ -124,6 +124,8 @@ pub async fn calculate_file_md5(file_path: &StdPath) -> Result<String, S3Error> 
 
 /// Calculate timeout based on file size (1MB = 2 seconds)
 pub fn calculate_timeout(file_size_bytes: u64) -> u64 {
+    // 1MB = 1_048_576 bytes, timeout = 2 seconds per MB
+    // Add minimum timeout of 10 seconds and maximum of 3600 seconds (1 hour)
     let timeout = (file_size_bytes as f64 / 1_048_576.0 * 2.0).ceil() as u64;
     timeout.max(10).min(3600)
 }
@@ -138,10 +140,12 @@ fn get_db_tree(db: &Db, tree: &str) -> Result<sled::Tree, S3Error> {
 fn read_index_md5(db: &Db, index_key: &str) -> Result<Option<String>, S3Error> {
     let index_tree = get_db_tree(db, INDEX_TREE)?;
     match index_tree.get(index_key) {
-        Ok(Some(data)) => String::from_utf8(data.to_vec()).map(Some).map_err(|e| {
-            error!("Failed to decode index record {}: {}", index_key, e);
-            S3Error::DatabaseError(e.to_string())
-        }),
+        Ok(Some(data)) => String::from_utf8(data.to_vec())
+            .map(Some)
+            .map_err(|e| {
+                error!("Failed to decode index record {}: {}", index_key, e);
+                S3Error::DatabaseError(e.to_string())
+            }),
         Ok(None) => Ok(None),
         Err(e) => {
             error!("Database read error for index key {}: {}", index_key, e);
@@ -152,13 +156,15 @@ fn read_index_md5(db: &Db, index_key: &str) -> Result<Option<String>, S3Error> {
 
 fn upsert_index_md5(db: &Db, index_key: &str, md5: &str) -> Result<(), S3Error> {
     let index_tree = get_db_tree(db, INDEX_TREE)?;
-    index_tree.insert(index_key, md5.as_bytes()).map_err(|e| {
-        error!(
-            "Database write error for index key {} -> {}: {}",
-            index_key, md5, e
-        );
-        S3Error::DatabaseError(e.to_string())
-    })?;
+    index_tree
+        .insert(index_key, md5.as_bytes())
+        .map_err(|e| {
+            error!(
+                "Database write error for index key {} -> {}: {}",
+                index_key, md5, e
+            );
+            S3Error::DatabaseError(e.to_string())
+        })?;
     Ok(())
 }
 
@@ -205,6 +211,7 @@ pub fn check_s3_file_exists_local(db: &Db, md5: &str) -> Result<Option<UploadRec
         }
     };
 
+    // Primary lookup
     match tree.get(md5) {
         Ok(Some(data)) => {
             if let Some(record) = decode(&data) {
@@ -358,10 +365,12 @@ pub async fn upload_bytes_to_s3(
         )
         .body(ByteStream::from(body_bytes));
 
+    // Add custom metadata
     for (key, value) in metadata.iter() {
         request = request.metadata(key, value);
     }
 
+    // Add compression info to metadata
     if compressed {
         request = request.content_encoding("zstd");
     }
@@ -396,6 +405,7 @@ pub async fn upload_bytes_to_s3(
 
 /// Upload a file to S3, optionally with compression (default true). If `s3_key`
 /// is `None`, the MD5 hash of the uncompressed file will be used as the key.
+/// Basic metadata such as `file_path` and `file_ext` is always attached.
 pub async fn upload_file_to_s3(
     client: &S3Client,
     bucket: &str,
@@ -432,6 +442,7 @@ pub async fn upload_file_to_s3(
         }
     }
 
+    // Always attach basic file metadata for traceability
     let file_path_value = file_path.to_string_lossy().into_owned();
     metadata.insert("file_path".to_string(), file_path_value);
     let file_ext_value = file_path
@@ -441,6 +452,7 @@ pub async fn upload_file_to_s3(
     metadata.insert("file_ext".to_string(), file_ext_value);
 
     if use_compression {
+        // Compress with ZSTD off the async runtime to avoid blocking other tasks
         let file_bytes = tokio::fs::read(file_path).await.map_err(|e| {
             error!("Failed to read file for S3 upload: {}", e);
             S3Error::FileReadError
@@ -497,8 +509,10 @@ pub async fn upload_file_to_s3(
         S3Error::FileReadError
     })?;
 
+    // Upload to S3
     let mut request = client.put_object().bucket(bucket).key(&key).body(body);
 
+    // Add custom metadata
     for (key, value) in metadata.iter() {
         request = request.metadata(key, value);
     }
@@ -565,6 +579,7 @@ pub async fn generate_presigned_url_by_md5(
     md5: &str,
     expires_in_seconds: u64,
 ) -> Result<String, S3Error> {
+    // Optional existence check to provide clearer error when key is missing
     if !check_s3_file_exists(client, bucket, md5).await {
         let msg = format!("Object not found in S3 for md5: {}", md5);
         error!("{}", msg);
@@ -731,185 +746,4 @@ pub async fn restore_metadata_from_s3(
     );
 
     Ok(restored)
-}
-
-/// Struct-based helper that keeps the S3 client, bucket, and DB handy.
-pub struct S3Helper {
-    client: S3Client,
-    bucket: String,
-    db: Option<Arc<Db>>,
-    default_use_compression: bool,
-    default_compression_level: i32,
-}
-
-impl S3Helper {
-    pub async fn from_config(config: S3Config, db: Option<Arc<Db>>) -> Result<Self, S3Error> {
-        let client = create_s3_client(&config).await?;
-        Ok(Self::new(
-            client,
-            config.bucket.clone(),
-            db,
-            config.use_compression,
-            config.compression_level,
-        ))
-    }
-
-    pub fn new(
-        client: S3Client,
-        bucket: String,
-        db: Option<Arc<Db>>,
-        default_use_compression: Option<bool>,
-        default_compression_level: Option<i32>,
-    ) -> Self {
-        Self {
-            client,
-            bucket,
-            db,
-            default_use_compression: default_use_compression.unwrap_or(true),
-            default_compression_level: default_compression_level.unwrap_or(19),
-        }
-    }
-
-    pub fn client(&self) -> &S3Client {
-        &self.client
-    }
-
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    pub fn db(&self) -> Option<&Db> {
-        self.db.as_deref()
-    }
-
-    pub async fn upload_file(
-        &self,
-        file_path: &StdPath,
-        index_key: Option<&str>,
-    ) -> Result<String, S3Error> {
-        self.upload_file_with_options(file_path, index_key, None, None, None, None)
-            .await
-    }
-
-    pub async fn upload_file_with_options(
-        &self,
-        file_path: &StdPath,
-        index_key: Option<&str>,
-        s3_key: Option<&str>,
-        use_compression: Option<bool>,
-        compression_level: Option<i32>,
-        metadata: Option<HashMap<String, String>>,
-    ) -> Result<String, S3Error> {
-        let use_compression = use_compression.unwrap_or(self.default_use_compression);
-        let compression_level = compression_level.unwrap_or(self.default_compression_level);
-        upload_file_to_s3(
-            &self.client,
-            &self.bucket,
-            file_path,
-            s3_key,
-            Some(use_compression),
-            Some(compression_level),
-            metadata,
-            self.db.as_deref(),
-            index_key,
-        )
-        .await
-    }
-
-    pub async fn upload_bytes(
-        &self,
-        bytes: Vec<u8>,
-        index_key: Option<&str>,
-    ) -> Result<String, S3Error> {
-        self.upload_bytes_with_option(bytes, index_key, None, None, None, None)
-            .await
-    }
-
-    pub async fn upload_bytes_with_option(
-        &self,
-        bytes: Vec<u8>,
-        index_key: Option<&str>,
-        s3_key: Option<&str>,
-        use_compression: Option<bool>,
-        compression_level: Option<i32>,
-        metadata: Option<HashMap<String, String>>,
-    ) -> Result<String, S3Error> {
-        let use_compression = use_compression.unwrap_or(self.default_use_compression);
-        let compression_level = compression_level.unwrap_or(self.default_compression_level);
-        upload_bytes_to_s3(
-            &self.client,
-            &self.bucket,
-            bytes,
-            s3_key,
-            Some(use_compression),
-            Some(compression_level),
-            metadata,
-            self.db.as_deref(),
-            index_key,
-        )
-        .await
-    }
-
-    pub async fn presign(&self, key: &str, expires_in_seconds: u64) -> Result<String, S3Error> {
-        generate_presigned_url(&self.client, &self.bucket, key, expires_in_seconds).await
-    }
-
-    pub async fn presign_by_md5(
-        &self,
-        md5: &str,
-        expires_in_seconds: u64,
-    ) -> Result<String, S3Error> {
-        generate_presigned_url_by_md5(&self.client, &self.bucket, md5, expires_in_seconds).await
-    }
-
-    pub async fn presign_by_index_key(
-        &self,
-        index_key: &str,
-        expires_in_seconds: u64,
-    ) -> Result<String, S3Error> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        generate_presigned_url_by_index_key(
-            &self.client,
-            &self.bucket,
-            db,
-            index_key,
-            expires_in_seconds,
-        )
-        .await
-    }
-
-    pub async fn backup_metadata(&self, backup_key: &str) -> Result<usize, S3Error> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        backup_metadata_to_s3(&self.client, &self.bucket, db, backup_key).await
-    }
-
-    pub async fn restore_metadata(
-        &self,
-        backup_key: &str,
-        clear_existing: bool,
-    ) -> Result<usize, S3Error> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        restore_metadata_from_s3(&self.client, &self.bucket, db, backup_key, clear_existing).await
-    }
-
-    pub fn check_local_record(&self, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
-        let db = self
-            .db
-            .as_deref()
-            .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        check_s3_file_exists_local(db, md5)
-    }
-
-    pub async fn object_exists(&self, key: &str) -> bool {
-        check_s3_file_exists(&self.client, &self.bucket, key).await
-    }
 }
