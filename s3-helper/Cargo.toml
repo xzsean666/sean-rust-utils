@@ -14,4 +14,5 @@ serde_yaml = "0.9"
 sled = "0.34"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zstd = "0.13"

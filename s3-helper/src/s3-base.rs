@@ -1,4 +1,4 @@
-use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
+use aws_config::{BehaviorVersion, meta::region::RegionProviderChain};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use md5::{Digest, Md5};
@@ -322,6 +322,10 @@ pub async fn upload_bytes_to_s3(
 
     if let Some(db) = db {
         if let Some(existing) = check_s3_file_exists_local(db, &md5_key)? {
+            info!(
+                "Existing upload found for md5 {}; skipping upload (path: {}, compressed: {})",
+                existing.md5, original_path, use_compression
+            );
             if let Some(index_key) = index_key_owned.as_deref() {
                 upsert_index_md5(db, index_key, &existing.md5)?;
             }
@@ -423,6 +427,10 @@ pub async fn upload_file_to_s3(
     if let (Some(db), Some(index_key)) = (db, index_key_owned.as_deref()) {
         if let Some(existing_md5) = read_index_md5(db, index_key)? {
             if let Some(existing) = check_s3_file_exists_local(db, &existing_md5)? {
+                info!(
+                    "Found existing upload for index key {} -> {}",
+                    index_key, existing_md5
+                );
                 return Ok(existing.md5);
             } else {
                 warn!(
@@ -487,6 +495,10 @@ pub async fn upload_file_to_s3(
 
     if let Some(db) = db {
         if let Some(existing) = check_s3_file_exists_local(db, &key)? {
+            info!(
+                "Existing upload found for md5 {}; skipping upload (path: {}, compressed: false)",
+                existing.md5, original_path
+            );
             if let Some(index_key) = index_key_owned.as_deref() {
                 upsert_index_md5(db, index_key, &existing.md5)?;
             }
@@ -903,12 +915,38 @@ impl S3Helper {
         restore_metadata_from_s3(&self.client, &self.bucket, db, backup_key, clear_existing).await
     }
 
-    pub fn check_local_record(&self, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
+    pub fn get_file_metadata_by_md5(&self, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
         let db = self
             .db
             .as_deref()
             .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
         check_s3_file_exists_local(db, md5)
+    }
+
+    pub fn get_file_metadata_by_index_key(
+        &self,
+        index_key: &str,
+    ) -> Result<Option<UploadRecord>, S3Error> {
+        let db = self
+            .db
+            .as_deref()
+            .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
+
+        let Some(md5) = read_index_md5(db, index_key)? else {
+            return Ok(None);
+        };
+
+        match check_s3_file_exists_local(db, &md5)? {
+            Some(record) => Ok(Some(record)),
+            None => {
+                warn!(
+                    "Metadata missing for index key {} -> {}, removing index entry",
+                    index_key, md5
+                );
+                remove_index_md5(db, index_key)?;
+                Ok(None)
+            }
+        }
     }
 
     pub async fn object_exists(&self, key: &str) -> bool {
