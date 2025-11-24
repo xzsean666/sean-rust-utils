@@ -25,6 +25,9 @@ pub struct S3Config {
     pub compression_level: Option<i32>,
 }
 
+const INDEX_TREE: &str = "index_records";
+const UPLOAD_TREE: &str = "upload_records";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum UploadStatus {
     #[serde(rename = "pending")]
@@ -57,6 +60,12 @@ struct UploadRecord {
     status: UploadStatus,
     file_size: u64,
     timeout_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct IndexRecord {
+    md5: String,
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -129,24 +138,81 @@ pub fn calculate_timeout(file_size_bytes: u64) -> u64 {
 
 /// Check if file has been uploaded by MD5
 fn get_upload_record(db: &Db, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
-    match db.get(md5) {
-        Ok(Some(data)) => {
-            match bincode::deserialize::<UploadRecord>(&data) {
-                Ok(record) => Ok(Some(record)),
-                Err(e) => {
-                    error!("Failed to deserialize upload record: {}", e);
-                    // Try to deserialize old format for backward compatibility
-                    // If it fails, return None to trigger re-upload
-                    Ok(None)
-                }
-            }
+    let tree = get_upload_tree(db)?;
+    let decode = |data: &[u8]| match bincode::deserialize::<UploadRecord>(data) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            error!("Failed to deserialize upload record: {}", e);
+            None
         }
+    };
+
+    // Check upload tree first
+    match tree.get(md5) {
+        Ok(Some(data)) => return Ok(decode(&data)),
+        Ok(None) => {}
+        Err(e) => {
+            error!("Database read error: {}", e);
+            return Err(S3Error::DatabaseError(e.to_string()));
+        }
+    }
+
+    // Backward compatibility: fall back to default tree
+    match db.get(md5) {
+        Ok(Some(data)) => Ok(decode(&data)),
         Ok(None) => Ok(None),
         Err(e) => {
             error!("Database read error: {}", e);
             Err(S3Error::DatabaseError(e.to_string()))
         }
     }
+}
+
+fn get_index_tree(db: &Db) -> Result<sled::Tree, S3Error> {
+    db.open_tree(INDEX_TREE).map_err(|e| {
+        error!("Failed to open index tree: {}", e);
+        S3Error::DatabaseError(e.to_string())
+    })
+}
+
+fn get_index_record(db: &Db, index_key: &str) -> Result<Option<IndexRecord>, S3Error> {
+    let tree = get_index_tree(db)?;
+    match tree.get(index_key) {
+        Ok(Some(data)) => match bincode::deserialize::<IndexRecord>(&data) {
+            Ok(record) => Ok(Some(record)),
+            Err(e) => {
+                error!("Failed to deserialize index record for {}: {}", index_key, e);
+                Ok(None)
+            }
+        },
+        Ok(None) => Ok(None),
+        Err(e) => {
+            error!("Database read error for index key {}: {}", index_key, e);
+            Err(S3Error::DatabaseError(e.to_string()))
+        }
+    }
+}
+
+fn save_index_record(db: &Db, index_key: &str, record: &IndexRecord) -> Result<(), S3Error> {
+    let tree = get_index_tree(db)?;
+    let data = bincode::serialize(record).map_err(|e| {
+        error!("Failed to serialize index record: {}", e);
+        S3Error::DatabaseError(e.to_string())
+    })?;
+
+    tree.insert(index_key, data).map_err(|e| {
+        error!("Database write error for index key {}: {}", index_key, e);
+        S3Error::DatabaseError(e.to_string())
+    })?;
+
+    Ok(())
+}
+
+fn get_upload_tree(db: &Db) -> Result<sled::Tree, S3Error> {
+    db.open_tree(UPLOAD_TREE).map_err(|e| {
+        error!("Failed to open upload tree: {}", e);
+        S3Error::DatabaseError(e.to_string())
+    })
 }
 
 /// Save upload record to database
@@ -156,7 +222,9 @@ fn save_upload_record(db: &Db, record: &UploadRecord) -> Result<(), S3Error> {
         S3Error::DatabaseError(e.to_string())
     })?;
 
-    db.insert(&record.md5, data).map_err(|e| {
+    let tree = get_upload_tree(db)?;
+
+    tree.insert(&record.md5, data).map_err(|e| {
         error!("Database write error: {}", e);
         S3Error::DatabaseError(e.to_string())
     })?;
@@ -166,6 +234,20 @@ fn save_upload_record(db: &Db, record: &UploadRecord) -> Result<(), S3Error> {
     // Only flush when absolutely necessary (e.g., before shutdown)
 
     Ok(())
+}
+
+/// Check locally recorded upload status for an MD5
+pub fn check_s3_file_exists_local(
+    db: &Db,
+    md5: &str,
+) -> Result<Option<UploadRecord>, S3Error> {
+    if let Some(record) = get_upload_record(db, md5)? {
+        if record.status == UploadStatus::Completed {
+            return Ok(Some(record));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Create and configure an S3 client
@@ -213,29 +295,98 @@ pub async fn upload_bytes_to_s3(
     client: &S3Client,
     bucket: &str,
     bytes: Vec<u8>,
-    s3_key: &str,
-    compressed: bool,
+    s3_key: Option<&str>,
+    use_compression: Option<bool>,
+    compression_level: Option<i32>,
     metadata: Option<HashMap<String, String>>,
-) -> Result<(), S3Error> {
+    db: Option<&Db>,
+    index_key: Option<&str>,
+) -> Result<String, S3Error> {
+    let mut metadata = metadata.unwrap_or_default();
+
+    if let Some(index_key) = index_key {
+        let db = db.ok_or_else(|| {
+            S3Error::DatabaseError(
+                "Database handle is required when using index_key".to_string(),
+            )
+        })?;
+
+        if let Some(existing) = get_index_record(db, index_key)? {
+            return Ok(existing.md5);
+        }
+    }
+
+    let use_compression = use_compression.unwrap_or(true);
+    let compression_level = compression_level.unwrap_or(19);
+    let mut final_s3_key = s3_key.map(|k| k.to_string());
+
+    if final_s3_key.is_none() {
+        let mut hasher = Md5::new();
+        hasher.update(&bytes);
+        final_s3_key = Some(format!("{:x}", hasher.finalize()));
+    }
+
+    let md5_key = final_s3_key
+        .as_ref()
+        .expect("S3 key should be set after MD5 calculation")
+        .to_string();
+
+    if let Some(db) = db {
+        if let Some(existing) = check_s3_file_exists_local(db, &md5_key)? {
+            if let Some(index_key) = index_key {
+                let mut index_metadata = metadata.clone();
+                index_metadata
+                    .entry("compressed".to_string())
+                    .or_insert(existing.compressed.to_string());
+                let record = IndexRecord {
+                    md5: existing.md5.clone(),
+                    metadata: index_metadata,
+                };
+                save_index_record(db, index_key, &record)?;
+            }
+            return Ok(existing.md5);
+        }
+    }
+
+    let (body_bytes, compressed) = if use_compression {
+        let compressed = tokio::task::spawn_blocking(move || {
+            zstd::encode_all(bytes.as_slice(), compression_level)
+        })
+        .await
+        .map_err(|e| {
+            error!("Compression task failed for S3 upload: {}", e);
+            S3Error::CompressionError
+        })?
+        .map_err(|e| {
+            error!("Failed to compress bytes for S3 upload: {}", e);
+            S3Error::CompressionError
+        })?;
+
+        (compressed, true)
+    } else {
+        (bytes, false)
+    };
+
+    metadata.insert("compressed".to_string(), compressed.to_string());
+
     let mut request = client
         .put_object()
         .bucket(bucket)
-        .key(s3_key)
-        .body(ByteStream::from(bytes));
+        .key(
+            final_s3_key
+                .as_ref()
+                .expect("S3 key should be set after MD5 calculation"),
+        )
+        .body(ByteStream::from(body_bytes));
 
     // Add custom metadata
-    if let Some(meta) = metadata {
-        for (key, value) in meta {
-            request = request.metadata(key, value);
-        }
+    for (key, value) in metadata.iter() {
+        request = request.metadata(key, value);
     }
 
     // Add compression info to metadata
     if compressed {
         request = request.content_encoding("zstd");
-        request = request.metadata("compressed", "true");
-    } else {
-        request = request.metadata("compressed", "false");
     }
 
     request.send().await.map_err(|e| {
@@ -243,21 +394,63 @@ pub async fn upload_bytes_to_s3(
         S3Error::UploadFailed(e.to_string())
     })?;
 
-    Ok(())
+    let key = final_s3_key.expect("S3 key should be set after MD5 calculation");
+
+    if let Some(index_key) = index_key {
+        let db = db.ok_or_else(|| {
+            S3Error::DatabaseError(
+                "Database handle is required when using index_key".to_string(),
+            )
+        })?;
+
+        let record = IndexRecord {
+            md5: key.clone(),
+            metadata: metadata.clone(),
+        };
+        save_index_record(db, index_key, &record)?;
+    }
+
+    Ok(key)
 }
 
-/// Upload a file to S3, optionally with compression. If `s3_key` is `None`,
-/// the MD5 hash of the uncompressed file will be used as the key.
+/// Upload a file to S3, optionally with compression (default true). If `s3_key`
+/// is `None`, the MD5 hash of the uncompressed file will be used as the key.
+/// Basic metadata such as `file_path` and `file_ext` is always attached.
 pub async fn upload_file_to_s3(
     client: &S3Client,
     bucket: &str,
     file_path: &StdPath,
     s3_key: Option<&str>,
-    use_compression: bool,
-    compression_level: i32,
+    use_compression: Option<bool>,
+    compression_level: Option<i32>,
     metadata: Option<HashMap<String, String>>,
+    db: Option<&Db>,
+    index_key: Option<&str>,
 ) -> Result<String, S3Error> {
-    let mut final_s3_key = s3_key.map(|k| k.to_string());
+    let use_compression = use_compression.unwrap_or(true);
+    let compression_level = compression_level.unwrap_or(19);
+    let mut metadata = metadata.unwrap_or_default();
+
+    if let Some(index_key) = index_key {
+        let db = db.ok_or_else(|| {
+            S3Error::DatabaseError(
+                "Database handle is required when using index_key".to_string(),
+            )
+        })?;
+
+        if let Some(existing) = get_index_record(db, index_key)? {
+            return Ok(existing.md5);
+        }
+    }
+
+    // Always attach basic file metadata for traceability
+    let file_path_value = file_path.to_string_lossy().into_owned();
+    metadata.insert("file_path".to_string(), file_path_value);
+    let file_ext_value = file_path
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "".to_string());
+    metadata.insert("file_ext".to_string(), file_ext_value);
 
     if use_compression {
         // Compress with ZSTD off the async runtime to avoid blocking other tasks
@@ -266,41 +459,21 @@ pub async fn upload_file_to_s3(
             S3Error::FileReadError
         })?;
 
-        if final_s3_key.is_none() {
-            let mut hasher = Md5::new();
-            hasher.update(&file_bytes);
-            final_s3_key = Some(format!("{:x}", hasher.finalize()));
-        }
-
-        let compressed = tokio::task::spawn_blocking(move || {
-            zstd::encode_all(file_bytes.as_slice(), compression_level)
-        })
-        .await
-        .map_err(|e| {
-            error!("Compression task failed for S3 upload: {}", e);
-            S3Error::CompressionError
-        })?
-        .map_err(|e| {
-            error!("Failed to compress file for S3 upload: {}", e);
-            S3Error::CompressionError
-        })?;
-
-        let key = final_s3_key
-            .clone()
-            .expect("S3 key should be set after MD5 calculation");
-
-        upload_bytes_to_s3(
+        return upload_bytes_to_s3(
             client,
             bucket,
-            compressed,
-            &key,
-            true,
-            metadata,
+            file_bytes,
+            s3_key,
+            Some(true),
+            Some(compression_level),
+            Some(metadata),
+            db,
+            index_key,
         )
-        .await?;
-
-        return Ok(key);
+        .await;
     }
+
+    let mut final_s3_key = s3_key.map(|k| k.to_string());
 
     if final_s3_key.is_none() {
         let md5 = calculate_file_md5(file_path).await?;
@@ -310,6 +483,25 @@ pub async fn upload_file_to_s3(
     let key = final_s3_key
         .clone()
         .expect("S3 key should be set after MD5 calculation");
+
+    metadata.insert("compressed".to_string(), "false".to_string());
+
+    if let Some(db) = db {
+        if let Some(existing) = check_s3_file_exists_local(db, &key)? {
+            if let Some(index_key) = index_key {
+                let mut index_metadata = metadata.clone();
+                index_metadata
+                    .entry("compressed".to_string())
+                    .or_insert(existing.compressed.to_string());
+                let record = IndexRecord {
+                    md5: existing.md5.clone(),
+                    metadata: index_metadata,
+                };
+                save_index_record(db, index_key, &record)?;
+            }
+            return Ok(existing.md5);
+        }
+    }
 
     let body = ByteStream::from_path(file_path)
         .await
@@ -326,19 +518,28 @@ pub async fn upload_file_to_s3(
         .body(body);
 
     // Add custom metadata
-    if let Some(meta) = metadata {
-        for (key, value) in meta {
-            request = request.metadata(key, value);
-        }
+    for (key, value) in metadata.iter() {
+        request = request.metadata(key, value);
     }
-
-    // Add compression info to metadata (this branch is only reached for uncompressed uploads)
-    request = request.metadata("compressed", "false");
 
     request.send().await.map_err(|e| {
         error!("Failed to upload to S3: {}", e);
         S3Error::UploadFailed(e.to_string())
     })?;
+
+    if let Some(index_key) = index_key {
+        let db = db.ok_or_else(|| {
+            S3Error::DatabaseError(
+                "Database handle is required when using index_key".to_string(),
+            )
+        })?;
+
+        let record = IndexRecord {
+            md5: key.clone(),
+            metadata: metadata.clone(),
+        };
+        save_index_record(db, index_key, &record)?;
+    }
 
     Ok(key)
 }
@@ -389,6 +590,24 @@ pub async fn generate_presigned_url_by_md5(
     generate_presigned_url(client, bucket, md5, expires_in_seconds).await
 }
 
+/// Generate a presigned URL using an index key mapped to an MD5
+pub async fn generate_presigned_url_by_index_key(
+    client: &S3Client,
+    bucket: &str,
+    db: &Db,
+    index_key: &str,
+    expires_in_seconds: u64,
+) -> Result<String, S3Error> {
+    let record = get_index_record(db, index_key).and_then(|r| {
+        r.ok_or_else(|| {
+            let msg = format!("Index key not found: {}", index_key);
+            S3Error::DatabaseError(msg)
+        })
+    })?;
+
+    generate_presigned_url_by_md5(client, bucket, &record.md5, expires_in_seconds).await
+}
+
 /// Backup all sled-stored upload metadata to S3
 pub async fn backup_metadata_to_s3(
     client: &S3Client,
@@ -398,7 +617,9 @@ pub async fn backup_metadata_to_s3(
 ) -> Result<usize, S3Error> {
     let mut records = BTreeMap::new();
 
-    for entry in db.iter() {
+    let tree = get_upload_tree(db)?;
+
+    for entry in tree.iter() {
         let (key, value) = entry.map_err(|e| {
             error!(
                 "Failed to iterate sled database for metadata backup: {}",
@@ -496,9 +717,11 @@ pub async fn restore_metadata_from_s3(
         S3Error::RestoreFailed(e.to_string())
     })?;
 
+    let tree = get_upload_tree(db)?;
+
     if clear_existing {
-        db.clear().map_err(|e| {
-            error!("Failed to clear sled database before restore: {}", e);
+        tree.clear().map_err(|e| {
+            error!("Failed to clear upload tree before restore: {}", e);
             S3Error::DatabaseError(e.to_string())
         })?;
     }
@@ -510,7 +733,7 @@ pub async fn restore_metadata_from_s3(
             S3Error::RestoreFailed(e.to_string())
         })?;
 
-        db.insert(key.as_bytes(), serialized).map_err(|e| {
+        tree.insert(key.as_bytes(), serialized).map_err(|e| {
             error!("Failed to insert restored record {}: {}", key, e);
             S3Error::DatabaseError(e.to_string())
         })?;
@@ -575,8 +798,10 @@ pub async fn upload_file_background(
         &config.bucket,
         &file_path,
         Some(&s3_key),
-        use_compression,
-        compression_level,
+        Some(use_compression),
+        Some(compression_level),
+        None,
+        Some(db.as_ref()),
         None,
     )
     .await;
