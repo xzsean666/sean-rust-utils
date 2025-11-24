@@ -1,4 +1,4 @@
-use aws_config::meta::region::RegionProviderChain;
+use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use md5::{Digest, Md5};
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct S3Config {
@@ -51,7 +51,7 @@ pub struct S3UrlResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct UploadRecord {
+pub struct UploadRecord {
     md5: String,
     s3_key: String,
     original_path: String,
@@ -234,7 +234,9 @@ pub async fn create_s3_client(config: &S3Config) -> Result<S3Client, S3Error> {
 
     let region = RegionProviderChain::first_try(aws_config::Region::new(config.region.clone()));
 
-    let mut config_builder = aws_config::from_env()
+    debug!(provider = %config.provider, "Building AWS config from defaults");
+
+    let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
         .credentials_provider(credentials)
         .region(region);
 

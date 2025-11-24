@@ -1,8 +1,7 @@
-// Minimal end-to-end demo for `src/s3-base.rs`.
+// Minimal end-to-end demo for `s3_base` library module.
 // Usage: cargo run --example s3_base_usage -- [config_path] [file_to_upload]
 // Defaults: config/config.yaml and Cargo.toml
-#[path = "../src/s3-base.rs"]
-mod s3_base;
+use s3_helper::s3_base;
 
 use serde::Deserialize;
 use sled::Db;
