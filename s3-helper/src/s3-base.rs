@@ -4,6 +4,7 @@ use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sled::Db;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,8 +59,17 @@ struct UploadRecord {
     timeout_seconds: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct MetadataBackup {
+    version: u32,
+    created_at: u64,
+    records: BTreeMap<String, UploadRecord>,
+}
+
 #[derive(Debug)]
 pub enum S3Error {
+    BackupFailed(String),
+    RestoreFailed(String),
     FileReadError,
     CompressionError,
     UploadFailed(String),
@@ -75,6 +85,8 @@ impl std::fmt::Display for S3Error {
             S3Error::UploadFailed(e) => write!(f, "Failed to upload to S3: {}", e),
             S3Error::PresignFailed(e) => write!(f, "Failed to generate presigned URL: {}", e),
             S3Error::DatabaseError(e) => write!(f, "Database error: {}", e),
+            S3Error::BackupFailed(e) => write!(f, "Failed to backup metadata: {}", e),
+            S3Error::RestoreFailed(e) => write!(f, "Failed to restore metadata: {}", e),
         }
     }
 }
@@ -196,22 +208,69 @@ pub async fn check_s3_file_exists(client: &S3Client, bucket: &str, key: &str) ->
     }
 }
 
-/// Upload a file to S3, optionally with compression
+/// Upload raw bytes to S3
+pub async fn upload_bytes_to_s3(
+    client: &S3Client,
+    bucket: &str,
+    bytes: Vec<u8>,
+    s3_key: &str,
+    compressed: bool,
+    metadata: Option<HashMap<String, String>>,
+) -> Result<(), S3Error> {
+    let mut request = client
+        .put_object()
+        .bucket(bucket)
+        .key(s3_key)
+        .body(ByteStream::from(bytes));
+
+    // Add custom metadata
+    if let Some(meta) = metadata {
+        for (key, value) in meta {
+            request = request.metadata(key, value);
+        }
+    }
+
+    // Add compression info to metadata
+    if compressed {
+        request = request.content_encoding("zstd");
+        request = request.metadata("compressed", "true");
+    } else {
+        request = request.metadata("compressed", "false");
+    }
+
+    request.send().await.map_err(|e| {
+        error!("Failed to upload to S3: {}", e);
+        S3Error::UploadFailed(e.to_string())
+    })?;
+
+    Ok(())
+}
+
+/// Upload a file to S3, optionally with compression. If `s3_key` is `None`,
+/// the MD5 hash of the uncompressed file will be used as the key.
 pub async fn upload_file_to_s3(
     client: &S3Client,
     bucket: &str,
     file_path: &StdPath,
-    s3_key: &str,
+    s3_key: Option<&str>,
     use_compression: bool,
     compression_level: i32,
-    metadata: Option<std::collections::HashMap<String, String>>,
-) -> Result<(), S3Error> {
-    let body = if use_compression {
+    metadata: Option<HashMap<String, String>>,
+) -> Result<String, S3Error> {
+    let mut final_s3_key = s3_key.map(|k| k.to_string());
+
+    if use_compression {
         // Compress with ZSTD off the async runtime to avoid blocking other tasks
         let file_bytes = tokio::fs::read(file_path).await.map_err(|e| {
             error!("Failed to read file for S3 upload: {}", e);
             S3Error::FileReadError
         })?;
+
+        if final_s3_key.is_none() {
+            let mut hasher = Md5::new();
+            hasher.update(&file_bytes);
+            final_s3_key = Some(format!("{:x}", hasher.finalize()));
+        }
 
         let compressed = tokio::task::spawn_blocking(move || {
             zstd::encode_all(file_bytes.as_slice(), compression_level)
@@ -226,16 +285,45 @@ pub async fn upload_file_to_s3(
             S3Error::CompressionError
         })?;
 
-        ByteStream::from(compressed)
-    } else {
-        ByteStream::from_path(file_path).await.map_err(|e| {
+        let key = final_s3_key
+            .clone()
+            .expect("S3 key should be set after MD5 calculation");
+
+        upload_bytes_to_s3(
+            client,
+            bucket,
+            compressed,
+            &key,
+            true,
+            metadata,
+        )
+        .await?;
+
+        return Ok(key);
+    }
+
+    if final_s3_key.is_none() {
+        let md5 = calculate_file_md5(file_path).await?;
+        final_s3_key = Some(md5);
+    }
+
+    let key = final_s3_key
+        .clone()
+        .expect("S3 key should be set after MD5 calculation");
+
+    let body = ByteStream::from_path(file_path)
+        .await
+        .map_err(|e| {
             error!("Failed to stream file for S3 upload: {}", e);
             S3Error::FileReadError
-        })?
-    };
+        })?;
 
     // Upload to S3
-    let mut request = client.put_object().bucket(bucket).key(s3_key).body(body);
+    let mut request = client
+        .put_object()
+        .bucket(bucket)
+        .key(&key)
+        .body(body);
 
     // Add custom metadata
     if let Some(meta) = metadata {
@@ -244,20 +332,15 @@ pub async fn upload_file_to_s3(
         }
     }
 
-    // Add compression info to metadata
-    if use_compression {
-        request = request.content_encoding("zstd");
-        request = request.metadata("compressed", "true");
-    } else {
-        request = request.metadata("compressed", "false");
-    }
+    // Add compression info to metadata (this branch is only reached for uncompressed uploads)
+    request = request.metadata("compressed", "false");
 
     request.send().await.map_err(|e| {
         error!("Failed to upload to S3: {}", e);
         S3Error::UploadFailed(e.to_string())
     })?;
 
-    Ok(())
+    Ok(key)
 }
 
 /// Generate a presigned URL for downloading a file from S3
@@ -287,6 +370,165 @@ pub async fn generate_presigned_url(
         })?;
 
     Ok(presigned_request.uri().to_string())
+}
+
+/// Generate a presigned URL using an object's MD5-based key
+pub async fn generate_presigned_url_by_md5(
+    client: &S3Client,
+    bucket: &str,
+    md5: &str,
+    expires_in_seconds: u64,
+) -> Result<String, S3Error> {
+    // Optional existence check to provide clearer error when key is missing
+    if !check_s3_file_exists(client, bucket, md5).await {
+        let msg = format!("Object not found in S3 for md5: {}", md5);
+        error!("{}", msg);
+        return Err(S3Error::PresignFailed(msg));
+    }
+
+    generate_presigned_url(client, bucket, md5, expires_in_seconds).await
+}
+
+/// Backup all sled-stored upload metadata to S3
+pub async fn backup_metadata_to_s3(
+    client: &S3Client,
+    bucket: &str,
+    db: &Db,
+    backup_key: &str,
+) -> Result<usize, S3Error> {
+    let mut records = BTreeMap::new();
+
+    for entry in db.iter() {
+        let (key, value) = entry.map_err(|e| {
+            error!(
+                "Failed to iterate sled database for metadata backup: {}",
+                e
+            );
+            S3Error::DatabaseError(e.to_string())
+        })?;
+
+        let key_str = String::from_utf8(key.to_vec()).map_err(|e| {
+            error!("Non-UTF8 key found during metadata backup: {}", e);
+            S3Error::BackupFailed(e.to_string())
+        })?;
+
+        let record: UploadRecord = bincode::deserialize(&value).map_err(|e| {
+            error!(
+                "Failed to deserialize upload record for key {} during backup: {}",
+                key_str, e
+            );
+            S3Error::BackupFailed(e.to_string())
+        })?;
+
+        records.insert(key_str, record);
+    }
+
+    let backup = MetadataBackup {
+        version: 1,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        records,
+    };
+
+    let serialized = bincode::serialize(&backup).map_err(|e| {
+        error!("Failed to serialize metadata backup: {}", e);
+        S3Error::BackupFailed(e.to_string())
+    })?;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(backup_key)
+        .metadata("metadata_backup", "sled_upload_records")
+        .content_type("application/octet-stream")
+        .body(ByteStream::from(serialized))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to upload metadata backup to S3: {}", e);
+            S3Error::BackupFailed(e.to_string())
+        })?;
+
+    info!(
+        "Backed up {} metadata records to s3://{}/{}",
+        backup.records.len(),
+        bucket,
+        backup_key
+    );
+
+    Ok(backup.records.len())
+}
+
+/// Restore sled-stored upload metadata from an S3 backup
+pub async fn restore_metadata_from_s3(
+    client: &S3Client,
+    bucket: &str,
+    db: &Db,
+    backup_key: &str,
+    clear_existing: bool,
+) -> Result<usize, S3Error> {
+    let response = client
+        .get_object()
+        .bucket(bucket)
+        .key(backup_key)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to download metadata backup from S3: {}", e);
+            S3Error::RestoreFailed(e.to_string())
+        })?;
+
+    let backup_bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| {
+            error!("Failed to read metadata backup body: {}", e);
+            S3Error::RestoreFailed(e.to_string())
+        })?
+        .into_bytes()
+        .to_vec();
+
+    let backup: MetadataBackup = bincode::deserialize(&backup_bytes).map_err(|e| {
+        error!("Failed to deserialize metadata backup: {}", e);
+        S3Error::RestoreFailed(e.to_string())
+    })?;
+
+    if clear_existing {
+        db.clear().map_err(|e| {
+            error!("Failed to clear sled database before restore: {}", e);
+            S3Error::DatabaseError(e.to_string())
+        })?;
+    }
+
+    let mut restored = 0usize;
+    for (key, record) in backup.records {
+        let serialized = bincode::serialize(&record).map_err(|e| {
+            error!("Failed to serialize upload record during restore: {}", e);
+            S3Error::RestoreFailed(e.to_string())
+        })?;
+
+        db.insert(key.as_bytes(), serialized).map_err(|e| {
+            error!("Failed to insert restored record {}: {}", key, e);
+            S3Error::DatabaseError(e.to_string())
+        })?;
+
+        restored += 1;
+    }
+
+    db.flush().map_err(|e| {
+        error!("Failed to flush sled database after restore: {}", e);
+        S3Error::DatabaseError(e.to_string())
+    })?;
+
+    info!(
+        "Restored {} metadata records from s3://{}/{}",
+        restored, bucket, backup_key
+    );
+
+    Ok(restored)
 }
 
 /// Background task to upload file to S3
@@ -332,7 +574,7 @@ pub async fn upload_file_background(
         &client,
         &config.bucket,
         &file_path,
-        &s3_key,
+        Some(&s3_key),
         use_compression,
         compression_level,
         None,
