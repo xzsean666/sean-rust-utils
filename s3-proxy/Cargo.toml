@@ -1,5 +1,5 @@
 [package]
-name = "sean-rust-utils"
+name = "s3-proxy"
 version = "0.1.0"
 edition = "2024"
 
