@@ -1,5 +1,6 @@
-use kvdb::KVDB;
+use kvdb::{KVCache, KVDB};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Profile {
@@ -67,7 +68,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paged: Vec<(String, u32)> = items_db.get_all(Some(1), Some(2))?;
     println!("paged items (offset=1, limit=2) => {:?}", paged);
 
-    // 6) 备份与恢复
+    // 6) KVCache 示例：将耗时计算的结果缓存 1 秒
+    let cache = KVCache::new(db.with_tree("cache")?).with_default_ttl(Duration::from_secs(1));
+    let cached_value = cache.get_or_insert_with("slow-call", None, || {
+        println!("only printed on cache miss");
+        "cached result".to_string()
+    })?;
+    let cached_again = cache.get_or_insert_with("slow-call", None, || "should not run".to_string())?;
+    println!("cache demo => first: {cached_value}, second: {cached_again}");
+
+    // 7) 备份与恢复
     let backup_path = db.backup_to_path("db/backups", 3)?;
     println!("backup created at {:?}", backup_path);
 
