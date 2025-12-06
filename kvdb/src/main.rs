@@ -1,6 +1,13 @@
 use kvdb::{KVCache, KVDB};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    },
+    thread,
+    time::Duration,
+};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Profile {
@@ -76,6 +83,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let cached_again = cache.get_or_insert_with("slow-call", None, || "should not run".to_string())?;
     println!("cache demo => first: {cached_value}, second: {cached_again}");
+
+    // 6b) 并发去重示例：多个线程请求同一个 key，只执行一次计算。
+    let cache_for_threads = cache.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(5)); // 4 workers + main
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let cache = cache_for_threads.clone();
+        let calls = Arc::clone(&calls);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            cache
+                .get_or_insert_with("heavy-work", None, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(50));
+                    99u64
+                })
+        }));
+    }
+
+    // 释放所有 worker，一起请求同一个 key。
+    barrier.wait();
+    let results: Vec<u64> = handles
+        .into_iter()
+        .map(|h| h.join().expect("worker panicked"))
+        .collect::<Result<_, _>>()?;
+    println!(
+        "concurrent cache => results: {:?}, compute_called: {} time(s)",
+        results,
+        calls.load(Ordering::SeqCst)
+    );
 
     // 7) 备份与恢复
     let backup_path = db.backup_to_path("db/backups", 3)?;

@@ -1,9 +1,7 @@
 use crate::kvdb::{KVDB, KVError};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::convert::Infallible;
 use std::error::Error;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -13,7 +11,6 @@ pub struct KVCache {
     db: KVDB,
     default_ttl: Option<Duration>,
     prefix: String,
-    locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug, Error)]
@@ -43,7 +40,6 @@ impl KVCache {
             db,
             default_ttl: None,
             prefix: String::new(),
-            locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -93,51 +89,26 @@ impl KVCache {
         E: Error + Send + Sync + 'static,
     {
         let combined_key = self.build_key(key.as_ref());
+        let now_ms = now_millis();
         let ttl = ttl.or(self.default_ttl);
 
         if let Some(entry) = self.db.get::<CacheEntry<V>>(&combined_key)? {
-            let now_ms = now_millis();
             if !entry.is_expired(now_ms) {
                 return Ok(entry.value);
             }
+            // drop expired entries to prevent unbounded growth
             let _ = self.db.delete(&combined_key);
         }
 
-        let key_lock = self.acquire_lock(&combined_key);
-
-        let result = {
-            let _guard = key_lock
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-
-            let mut cached = None;
-            if let Some(entry) = self.db.get::<CacheEntry<V>>(&combined_key)? {
-                let now_ms = now_millis();
-                if !entry.is_expired(now_ms) {
-                    cached = Some(entry.value);
-                } else {
-                    let _ = self.db.delete(&combined_key);
-                }
-            }
-
-            if let Some(value) = cached {
-                Ok(value)
-            } else {
-                let now_ms = now_millis();
-                let value = compute().map_err(|err| CacheError::Compute(Box::new(err)))?;
-                let expires_at_ms = ttl.map(|d| now_ms.saturating_add(d.as_millis() as u128));
-                let entry = CacheEntry {
-                    value,
-                    expires_at_ms,
-                };
-
-                self.db.put(&combined_key, &entry)?;
-                Ok(entry.value)
-            }
+        let value = compute().map_err(|err| CacheError::Compute(Box::new(err)))?;
+        let expires_at_ms = ttl.map(|d| now_ms.saturating_add(d.as_millis() as u128));
+        let entry = CacheEntry {
+            value,
+            expires_at_ms,
         };
 
-        self.cleanup_lock(&combined_key);
-        result
+        self.db.put(&combined_key, &entry)?;
+        Ok(entry.value)
     }
 
     fn build_key(&self, raw_key: &str) -> String {
@@ -153,31 +124,6 @@ impl KVCache {
         }
         key
     }
-
-    fn acquire_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        const MAX_LOCKS: usize = 10_000;
-
-        let mut locks = self.locks.lock().expect("in-flight lock map poisoned");
-        let lock = locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-
-        if locks.len() > MAX_LOCKS {
-            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-        }
-
-        lock
-    }
-
-    fn cleanup_lock(&self, key: &str) {
-        let mut locks = self.locks.lock().expect("in-flight lock map poisoned");
-        if let Some(lock) = locks.get(key) {
-            if Arc::strong_count(lock) == 1 {
-                locks.remove(key);
-            }
-        }
-    }
 }
 
 fn now_millis() -> u128 {
@@ -190,14 +136,12 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Barrier,
-        },
-        thread::{self, sleep},
-        time::Duration,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
+    use std::thread::sleep;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -260,36 +204,5 @@ mod tests {
             CacheError::Compute(_) => {}
             other => panic!("unexpected error: {other:?}"),
         }
-    }
-
-    #[test]
-    fn deduplicates_inflight_work() {
-        let dir = tempdir().unwrap();
-        let base = KVDB::new(dir.path().join("inflight.db"), "cache").unwrap();
-        let cache = Arc::new(KVCache::new(base));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(5));
-
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let cache = Arc::clone(&cache);
-            let calls = Arc::clone(&calls);
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                cache
-                    .get_or_insert_with("heavy", None, || {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        sleep(Duration::from_millis(50));
-                        99u64
-                    })
-                    .unwrap()
-            }));
-        }
-
-        barrier.wait();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert!(results.iter().all(|v| *v == 99u64));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

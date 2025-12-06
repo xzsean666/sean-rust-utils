@@ -1,13 +1,15 @@
+use crate::kvdb::{KVDB, KVError};
 use aws_config::{BehaviorVersion, meta::region::RegionProviderChain};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use sled::Db;
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path as StdPath;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fs,
+    path::Path as StdPath,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
@@ -62,13 +64,6 @@ pub struct UploadRecord {
     timeout_seconds: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct MetadataBackup {
-    version: u32,
-    created_at: u64,
-    records: BTreeMap<String, UploadRecord>,
-}
-
 #[derive(Debug)]
 pub enum S3Error {
     BackupFailed(String),
@@ -77,6 +72,7 @@ pub enum S3Error {
     CompressionError,
     UploadFailed(String),
     PresignFailed(String),
+    Database(KVError),
     DatabaseError(String),
 }
 
@@ -87,6 +83,7 @@ impl std::fmt::Display for S3Error {
             S3Error::CompressionError => write!(f, "Failed to compress file for S3 upload"),
             S3Error::UploadFailed(e) => write!(f, "Failed to upload to S3: {}", e),
             S3Error::PresignFailed(e) => write!(f, "Failed to generate presigned URL: {}", e),
+            S3Error::Database(e) => write!(f, "Database error: {}", e),
             S3Error::DatabaseError(e) => write!(f, "Database error: {}", e),
             S3Error::BackupFailed(e) => write!(f, "Failed to backup metadata: {}", e),
             S3Error::RestoreFailed(e) => write!(f, "Failed to restore metadata: {}", e),
@@ -95,6 +92,12 @@ impl std::fmt::Display for S3Error {
 }
 
 impl std::error::Error for S3Error {}
+
+impl From<KVError> for S3Error {
+    fn from(err: KVError) -> Self {
+        Self::Database(err)
+    }
+}
 
 /// Calculate MD5 hash of file contents
 pub async fn calculate_file_md5(file_path: &StdPath) -> Result<String, S3Error> {
@@ -128,64 +131,6 @@ pub fn calculate_timeout(file_size_bytes: u64) -> u64 {
     timeout.max(10).min(3600)
 }
 
-fn get_db_tree(db: &Db, tree: &str) -> Result<sled::Tree, S3Error> {
-    db.open_tree(tree).map_err(|e| {
-        error!("Failed to open sled tree {}: {}", tree, e);
-        S3Error::DatabaseError(e.to_string())
-    })
-}
-
-fn read_index_md5(db: &Db, index_key: &str) -> Result<Option<String>, S3Error> {
-    let index_tree = get_db_tree(db, INDEX_TREE)?;
-    match index_tree.get(index_key) {
-        Ok(Some(data)) => String::from_utf8(data.to_vec()).map(Some).map_err(|e| {
-            error!("Failed to decode index record {}: {}", index_key, e);
-            S3Error::DatabaseError(e.to_string())
-        }),
-        Ok(None) => Ok(None),
-        Err(e) => {
-            error!("Database read error for index key {}: {}", index_key, e);
-            Err(S3Error::DatabaseError(e.to_string()))
-        }
-    }
-}
-
-fn upsert_index_md5(db: &Db, index_key: &str, md5: &str) -> Result<(), S3Error> {
-    let index_tree = get_db_tree(db, INDEX_TREE)?;
-    index_tree.insert(index_key, md5.as_bytes()).map_err(|e| {
-        error!(
-            "Database write error for index key {} -> {}: {}",
-            index_key, md5, e
-        );
-        S3Error::DatabaseError(e.to_string())
-    })?;
-    Ok(())
-}
-
-fn remove_index_md5(db: &Db, index_key: &str) -> Result<(), S3Error> {
-    let index_tree = get_db_tree(db, INDEX_TREE)?;
-    index_tree.remove(index_key).map_err(|e| {
-        error!("Failed to remove index key {}: {}", index_key, e);
-        S3Error::DatabaseError(e.to_string())
-    })?;
-    Ok(())
-}
-
-fn persist_upload_record(db: &Db, record: &UploadRecord) -> Result<(), S3Error> {
-    let tree = get_db_tree(db, UPLOAD_TREE)?;
-    let data = bincode::serialize(record).map_err(|e| {
-        error!("Failed to serialize upload record {}: {}", record.md5, e);
-        S3Error::DatabaseError(e.to_string())
-    })?;
-
-    tree.insert(record.md5.as_bytes(), data).map_err(|e| {
-        error!("Failed to persist upload record {}: {}", record.md5, e);
-        S3Error::DatabaseError(e.to_string())
-    })?;
-
-    Ok(())
-}
-
 fn current_timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -193,33 +138,95 @@ fn current_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-/// Check locally recorded upload status for an MD5
-pub fn check_s3_file_exists_local(db: &Db, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
-    let tree = get_db_tree(db, UPLOAD_TREE)?;
+#[derive(Clone)]
+pub struct S3MetadataStore {
+    uploads: KVDB,
+    index: KVDB,
+}
 
-    let decode = |data: &[u8]| match bincode::deserialize::<UploadRecord>(data) {
-        Ok(record) => Some(record),
-        Err(e) => {
-            error!("Failed to deserialize upload record: {}", e);
-            None
-        }
-    };
-
-    match tree.get(md5) {
-        Ok(Some(data)) => {
-            if let Some(record) = decode(&data) {
-                if record.status == UploadStatus::Completed {
-                    return Ok(Some(record));
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            error!("Database read error: {}", e);
-            return Err(S3Error::DatabaseError(e.to_string()));
-        }
+impl S3MetadataStore {
+    /// Build metadata store for uploads and index trees from an existing KVDB handle.
+    pub fn new(db: KVDB) -> Result<Self, S3Error> {
+        Ok(Self {
+            uploads: db.with_tree(UPLOAD_TREE)?,
+            index: db.with_tree(INDEX_TREE)?,
+        })
     }
-    Ok(None)
+
+    fn lookup_index_md5(&self, index_key: &str) -> Result<Option<String>, S3Error> {
+        self.index.get::<String>(index_key).map_err(Into::into)
+    }
+
+    fn upsert_index_md5(&self, index_key: &str, md5: &str) -> Result<(), S3Error> {
+        self.index
+            .put(index_key, &md5.to_string())
+            .map_err(Into::into)
+    }
+
+    fn remove_index_md5(&self, index_key: &str) -> Result<(), S3Error> {
+        self.index.delete(index_key).map(|_| ()).map_err(Into::into)
+    }
+
+    fn persist_upload_record(&self, record: &UploadRecord) -> Result<(), S3Error> {
+        self.uploads.put(&record.md5, record).map_err(Into::into)
+    }
+
+    /// Check locally recorded upload status for an MD5
+    fn completed_upload(&self, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
+        let record = self.uploads.get::<UploadRecord>(md5)?;
+        Ok(record.filter(|rec| rec.status == UploadStatus::Completed))
+    }
+
+    fn upload_records(&self) -> Result<BTreeMap<String, UploadRecord>, S3Error> {
+        Ok(self
+            .uploads
+            .get_all::<UploadRecord>(None, None)?
+            .into_iter()
+            .collect())
+    }
+
+    fn backup_bytes(&self) -> Result<Vec<u8>, S3Error> {
+        self.uploads.create_backup_bytes().map_err(Into::into)
+    }
+
+    fn restore_from_backup_bytes(
+        &self,
+        backup_bytes: &[u8],
+        clear_existing: bool,
+    ) -> Result<usize, S3Error> {
+        let temp_dir = env::temp_dir().join(format!(
+            "s3_metadata_restore_{}_{}",
+            current_timestamp_secs(),
+            std::process::id()
+        ));
+
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+
+        KVDB::restore_from_bytes(backup_bytes, &temp_dir)?;
+        let temp_db = KVDB::new(&temp_dir, UPLOAD_TREE)?;
+        let temp_store = S3MetadataStore::new(temp_db)?;
+
+        let upload_records = temp_store.upload_records()?;
+        let index_records = temp_store.index.get_all::<String>(None, None)?;
+
+        if clear_existing {
+            self.uploads.clear()?;
+            self.index.clear()?;
+        }
+
+        if !upload_records.is_empty() {
+            self.uploads.put_many(upload_records.clone())?;
+        }
+        if !index_records.is_empty() {
+            self.index.put_many(index_records.clone())?;
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        Ok(upload_records.len())
+    }
 }
 
 /// Create and configure an S3 client
@@ -273,28 +280,28 @@ pub async fn upload_bytes_to_s3(
     use_compression: Option<bool>,
     compression_level: Option<i32>,
     metadata: Option<HashMap<String, String>>,
-    db: Option<&Db>,
+    metadata_store: Option<&S3MetadataStore>,
     index_key: Option<&str>,
 ) -> Result<String, S3Error> {
     let mut metadata = metadata.unwrap_or_default();
     let index_key_owned = index_key.map(|k| k.to_string());
 
-    if index_key_owned.is_some() && db.is_none() {
+    if index_key_owned.is_some() && metadata_store.is_none() {
         return Err(S3Error::DatabaseError(
             "Database handle is required when using index_key".to_string(),
         ));
     }
 
-    if let (Some(db), Some(index_key)) = (db, index_key_owned.as_deref()) {
-        if let Some(existing_md5) = read_index_md5(db, index_key)? {
-            if let Some(existing) = check_s3_file_exists_local(db, &existing_md5)? {
+    if let (Some(store), Some(index_key)) = (metadata_store, index_key_owned.as_deref()) {
+        if let Some(existing_md5) = store.lookup_index_md5(index_key)? {
+            if let Some(existing) = store.completed_upload(&existing_md5)? {
                 return Ok(existing.md5);
             } else {
                 warn!(
                     "Removing stale index entry {} -> {} because metadata is missing",
                     index_key, existing_md5
                 );
-                remove_index_md5(db, index_key)?;
+                store.remove_index_md5(index_key)?;
             }
         }
     }
@@ -320,14 +327,14 @@ pub async fn upload_bytes_to_s3(
         .expect("S3 key should be set after MD5 calculation")
         .to_string();
 
-    if let Some(db) = db {
-        if let Some(existing) = check_s3_file_exists_local(db, &md5_key)? {
+    if let Some(store) = metadata_store {
+        if let Some(existing) = store.completed_upload(&md5_key)? {
             info!(
                 "Existing upload found for md5 {}; skipping upload (path: {}, compressed: {})",
                 existing.md5, original_path, use_compression
             );
             if let Some(index_key) = index_key_owned.as_deref() {
-                upsert_index_md5(db, index_key, &existing.md5)?;
+                store.upsert_index_md5(index_key, &existing.md5)?;
             }
             return Ok(existing.md5);
         }
@@ -379,7 +386,7 @@ pub async fn upload_bytes_to_s3(
 
     let key = final_s3_key.expect("S3 key should be set after MD5 calculation");
 
-    if let Some(db) = db {
+    if let Some(store) = metadata_store {
         let record = UploadRecord {
             md5: key.clone(),
             s3_key: key.clone(),
@@ -390,10 +397,10 @@ pub async fn upload_bytes_to_s3(
             file_size: original_file_size,
             timeout_seconds,
         };
-        persist_upload_record(db, &record)?;
+        store.persist_upload_record(&record)?;
 
         if let Some(index_key) = index_key_owned.as_deref() {
-            upsert_index_md5(db, index_key, &record.md5)?;
+            store.upsert_index_md5(index_key, &record.md5)?;
         }
     }
 
@@ -410,7 +417,7 @@ pub async fn upload_file_to_s3(
     use_compression: Option<bool>,
     compression_level: Option<i32>,
     metadata: Option<HashMap<String, String>>,
-    db: Option<&Db>,
+    metadata_store: Option<&S3MetadataStore>,
     index_key: Option<&str>,
 ) -> Result<String, S3Error> {
     let use_compression = use_compression.unwrap_or(true);
@@ -418,15 +425,15 @@ pub async fn upload_file_to_s3(
     let mut metadata = metadata.unwrap_or_default();
     let index_key_owned = index_key.map(|k| k.to_string());
 
-    if index_key_owned.is_some() && db.is_none() {
+    if index_key_owned.is_some() && metadata_store.is_none() {
         return Err(S3Error::DatabaseError(
             "Database handle is required when using index_key".to_string(),
         ));
     }
 
-    if let (Some(db), Some(index_key)) = (db, index_key_owned.as_deref()) {
-        if let Some(existing_md5) = read_index_md5(db, index_key)? {
-            if let Some(existing) = check_s3_file_exists_local(db, &existing_md5)? {
+    if let (Some(store), Some(index_key)) = (metadata_store, index_key_owned.as_deref()) {
+        if let Some(existing_md5) = store.lookup_index_md5(index_key)? {
+            if let Some(existing) = store.completed_upload(&existing_md5)? {
                 info!(
                     "Found existing upload for index key {} -> {}",
                     index_key, existing_md5
@@ -437,7 +444,7 @@ pub async fn upload_file_to_s3(
                     "Removing stale index entry {} -> {} because metadata is missing",
                     index_key, existing_md5
                 );
-                remove_index_md5(db, index_key)?;
+                store.remove_index_md5(index_key)?;
             }
         }
     }
@@ -464,7 +471,7 @@ pub async fn upload_file_to_s3(
             Some(true),
             Some(compression_level),
             Some(metadata),
-            db,
+            metadata_store,
             index_key_owned.as_deref(),
         )
         .await;
@@ -493,14 +500,14 @@ pub async fn upload_file_to_s3(
     let file_size = file_metadata.len();
     let timeout_seconds = calculate_timeout(file_size);
 
-    if let Some(db) = db {
-        if let Some(existing) = check_s3_file_exists_local(db, &key)? {
+    if let Some(store) = metadata_store {
+        if let Some(existing) = store.completed_upload(&key)? {
             info!(
                 "Existing upload found for md5 {}; skipping upload (path: {}, compressed: false)",
                 existing.md5, original_path
             );
             if let Some(index_key) = index_key_owned.as_deref() {
-                upsert_index_md5(db, index_key, &existing.md5)?;
+                store.upsert_index_md5(index_key, &existing.md5)?;
             }
             return Ok(existing.md5);
         }
@@ -522,7 +529,7 @@ pub async fn upload_file_to_s3(
         S3Error::UploadFailed(e.to_string())
     })?;
 
-    if let Some(db) = db {
+    if let Some(store) = metadata_store {
         let record = UploadRecord {
             md5: key.clone(),
             s3_key: key.clone(),
@@ -533,10 +540,10 @@ pub async fn upload_file_to_s3(
             file_size,
             timeout_seconds,
         };
-        persist_upload_record(db, &record)?;
+        store.persist_upload_record(&record)?;
 
         if let Some(index_key) = index_key_owned.as_deref() {
-            upsert_index_md5(db, index_key, &record.md5)?;
+            store.upsert_index_md5(index_key, &record.md5)?;
         }
     }
 
@@ -592,11 +599,11 @@ pub async fn generate_presigned_url_by_md5(
 pub async fn generate_presigned_url_by_index_key(
     client: &S3Client,
     bucket: &str,
-    db: &Db,
+    metadata_store: &S3MetadataStore,
     index_key: &str,
     expires_in_seconds: u64,
 ) -> Result<String, S3Error> {
-    let md5 = read_index_md5(db, index_key)?.ok_or_else(|| {
+    let md5 = metadata_store.lookup_index_md5(index_key)?.ok_or_else(|| {
         let msg = format!("Index key not found: {}", index_key);
         S3Error::DatabaseError(msg)
     })?;
@@ -604,60 +611,23 @@ pub async fn generate_presigned_url_by_index_key(
     generate_presigned_url_by_md5(client, bucket, &md5, expires_in_seconds).await
 }
 
-/// Backup all sled-stored upload metadata to S3
+/// Backup all KVDB-stored upload metadata to S3
 pub async fn backup_metadata_to_s3(
     client: &S3Client,
     bucket: &str,
-    db: &Db,
+    metadata_store: &S3MetadataStore,
     backup_key: &str,
 ) -> Result<usize, S3Error> {
-    let mut records = BTreeMap::new();
-
-    let tree = get_db_tree(db, UPLOAD_TREE)?;
-
-    for entry in tree.iter() {
-        let (key, value) = entry.map_err(|e| {
-            error!("Failed to iterate sled database for metadata backup: {}", e);
-            S3Error::DatabaseError(e.to_string())
-        })?;
-
-        let key_str = String::from_utf8(key.to_vec()).map_err(|e| {
-            error!("Non-UTF8 key found during metadata backup: {}", e);
-            S3Error::BackupFailed(e.to_string())
-        })?;
-
-        let record: UploadRecord = bincode::deserialize(&value).map_err(|e| {
-            error!(
-                "Failed to deserialize upload record for key {} during backup: {}",
-                key_str, e
-            );
-            S3Error::BackupFailed(e.to_string())
-        })?;
-
-        records.insert(key_str, record);
-    }
-
-    let backup = MetadataBackup {
-        version: 1,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-        records,
-    };
-
-    let serialized = bincode::serialize(&backup).map_err(|e| {
-        error!("Failed to serialize metadata backup: {}", e);
-        S3Error::BackupFailed(e.to_string())
-    })?;
+    let record_count = metadata_store.upload_records()?.len();
+    let backup_bytes = metadata_store.backup_bytes()?;
 
     client
         .put_object()
         .bucket(bucket)
         .key(backup_key)
-        .metadata("metadata_backup", "sled_upload_records")
+        .metadata("metadata_backup", "kvdb_backup")
         .content_type("application/octet-stream")
-        .body(ByteStream::from(serialized))
+        .body(ByteStream::from(backup_bytes))
         .send()
         .await
         .map_err(|e| {
@@ -667,19 +637,17 @@ pub async fn backup_metadata_to_s3(
 
     info!(
         "Backed up {} metadata records to s3://{}/{}",
-        backup.records.len(),
-        bucket,
-        backup_key
+        record_count, bucket, backup_key
     );
 
-    Ok(backup.records.len())
+    Ok(record_count)
 }
 
-/// Restore sled-stored upload metadata from an S3 backup
+/// Restore KVDB-stored upload metadata from an S3 backup
 pub async fn restore_metadata_from_s3(
     client: &S3Client,
     bucket: &str,
-    db: &Db,
+    metadata_store: &S3MetadataStore,
     backup_key: &str,
     clear_existing: bool,
 ) -> Result<usize, S3Error> {
@@ -705,39 +673,7 @@ pub async fn restore_metadata_from_s3(
         .into_bytes()
         .to_vec();
 
-    let backup: MetadataBackup = bincode::deserialize(&backup_bytes).map_err(|e| {
-        error!("Failed to deserialize metadata backup: {}", e);
-        S3Error::RestoreFailed(e.to_string())
-    })?;
-
-    let tree = get_db_tree(db, UPLOAD_TREE)?;
-
-    if clear_existing {
-        tree.clear().map_err(|e| {
-            error!("Failed to clear upload tree before restore: {}", e);
-            S3Error::DatabaseError(e.to_string())
-        })?;
-    }
-
-    let mut restored = 0usize;
-    for (key, record) in backup.records {
-        let serialized = bincode::serialize(&record).map_err(|e| {
-            error!("Failed to serialize upload record during restore: {}", e);
-            S3Error::RestoreFailed(e.to_string())
-        })?;
-
-        tree.insert(key.as_bytes(), serialized).map_err(|e| {
-            error!("Failed to insert restored record {}: {}", key, e);
-            S3Error::DatabaseError(e.to_string())
-        })?;
-
-        restored += 1;
-    }
-
-    db.flush().map_err(|e| {
-        error!("Failed to flush sled database after restore: {}", e);
-        S3Error::DatabaseError(e.to_string())
-    })?;
+    let restored = metadata_store.restore_from_backup_bytes(&backup_bytes, clear_existing)?;
 
     info!(
         "Restored {} metadata records from s3://{}/{}",
@@ -751,37 +687,42 @@ pub async fn restore_metadata_from_s3(
 pub struct S3Helper {
     client: S3Client,
     bucket: String,
-    db: Option<Arc<Db>>,
+    metadata: Option<S3MetadataStore>,
     default_use_compression: bool,
     default_compression_level: i32,
 }
 
 impl S3Helper {
-    pub async fn from_config(config: S3Config, db: Option<Arc<Db>>) -> Result<Self, S3Error> {
+    pub async fn from_config(config: S3Config, db: Option<KVDB>) -> Result<Self, S3Error> {
         let client = create_s3_client(&config).await?;
-        Ok(Self::new(
+        Self::new(
             client,
             config.bucket.clone(),
             db,
             config.use_compression,
             config.compression_level,
-        ))
+        )
     }
 
     pub fn new(
         client: S3Client,
         bucket: String,
-        db: Option<Arc<Db>>,
+        db: Option<KVDB>,
         default_use_compression: Option<bool>,
         default_compression_level: Option<i32>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, S3Error> {
+        let metadata = match db {
+            Some(db) => Some(S3MetadataStore::new(db)?),
+            None => None,
+        };
+
+        Ok(Self {
             client,
             bucket,
-            db,
+            metadata,
             default_use_compression: default_use_compression.unwrap_or(true),
             default_compression_level: default_compression_level.unwrap_or(19),
-        }
+        })
     }
 
     pub fn client(&self) -> &S3Client {
@@ -792,8 +733,8 @@ impl S3Helper {
         &self.bucket
     }
 
-    pub fn db(&self) -> Option<&Db> {
-        self.db.as_deref()
+    pub fn metadata_store(&self) -> Option<&S3MetadataStore> {
+        self.metadata.as_ref()
     }
 
     pub async fn upload_file(
@@ -824,7 +765,7 @@ impl S3Helper {
             Some(use_compression),
             Some(compression_level),
             metadata,
-            self.db.as_deref(),
+            self.metadata.as_ref(),
             index_key,
         )
         .await
@@ -858,7 +799,7 @@ impl S3Helper {
             Some(use_compression),
             Some(compression_level),
             metadata,
-            self.db.as_deref(),
+            self.metadata.as_ref(),
             index_key,
         )
         .await
@@ -881,14 +822,14 @@ impl S3Helper {
         index_key: &str,
         expires_in_seconds: u64,
     ) -> Result<String, S3Error> {
-        let db = self
-            .db
-            .as_deref()
+        let metadata = self
+            .metadata
+            .as_ref()
             .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
         generate_presigned_url_by_index_key(
             &self.client,
             &self.bucket,
-            db,
+            metadata,
             index_key,
             expires_in_seconds,
         )
@@ -896,11 +837,11 @@ impl S3Helper {
     }
 
     pub async fn backup_metadata(&self, backup_key: &str) -> Result<usize, S3Error> {
-        let db = self
-            .db
-            .as_deref()
+        let metadata = self
+            .metadata
+            .as_ref()
             .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        backup_metadata_to_s3(&self.client, &self.bucket, db, backup_key).await
+        backup_metadata_to_s3(&self.client, &self.bucket, metadata, backup_key).await
     }
 
     pub async fn restore_metadata(
@@ -908,42 +849,49 @@ impl S3Helper {
         backup_key: &str,
         clear_existing: bool,
     ) -> Result<usize, S3Error> {
-        let db = self
-            .db
-            .as_deref()
+        let metadata = self
+            .metadata
+            .as_ref()
             .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        restore_metadata_from_s3(&self.client, &self.bucket, db, backup_key, clear_existing).await
+        restore_metadata_from_s3(
+            &self.client,
+            &self.bucket,
+            metadata,
+            backup_key,
+            clear_existing,
+        )
+        .await
     }
 
     pub fn get_file_metadata_by_md5(&self, md5: &str) -> Result<Option<UploadRecord>, S3Error> {
-        let db = self
-            .db
-            .as_deref()
+        let metadata = self
+            .metadata
+            .as_ref()
             .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
-        check_s3_file_exists_local(db, md5)
+        metadata.completed_upload(md5)
     }
 
     pub fn get_file_metadata_by_index_key(
         &self,
         index_key: &str,
     ) -> Result<Option<UploadRecord>, S3Error> {
-        let db = self
-            .db
-            .as_deref()
+        let metadata = self
+            .metadata
+            .as_ref()
             .ok_or_else(|| S3Error::DatabaseError("DB handle is required".to_string()))?;
 
-        let Some(md5) = read_index_md5(db, index_key)? else {
+        let Some(md5) = metadata.lookup_index_md5(index_key)? else {
             return Ok(None);
         };
 
-        match check_s3_file_exists_local(db, &md5)? {
+        match metadata.completed_upload(&md5)? {
             Some(record) => Ok(Some(record)),
             None => {
                 warn!(
                     "Metadata missing for index key {} -> {}, removing index entry",
                     index_key, md5
                 );
-                remove_index_md5(db, index_key)?;
+                metadata.remove_index_md5(index_key)?;
                 Ok(None)
             }
         }
